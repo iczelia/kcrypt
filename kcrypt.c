@@ -1,7 +1,8 @@
 // ---------------------------------------------------------------------------
-//      KCrypt3 - 3rd iteration of the KCrypt algorithm.
-//      Written on Sunday, 20th of April 2025 by Kamila Szewczyk.
+//      KCrypt - 4th iteration of a cryptographic algorithm.
+//      Written on Monday, 3rd of August 2026 by Kamila Szewczyk.
 // ---------------------------------------------------------------------------
+#include <immintrin.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,124 +11,96 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <x86intrin.h>
 #include "yarg.h"
 
 // ---------------------------------------------------------------------------
 //      Galois field tables.
 // ---------------------------------------------------------------------------
 typedef uint8_t gf;
-static gf LOG[256], EXP[510], PROD[256][256];
+static gf LOG[256], EXP[510];
 static void gentab(gf poly) {
   for (int l = 0, b = 1; l < 255; l++) {
     LOG[b] = l;  EXP[l] = EXP[l + 255] = b;
     if ((b <<= 1) >= 256)
       b = (b - 256) ^ poly;
   }
-  for (int i = 1; i < 256; i++)
-    for (int j = 1; j < 256; j++)
-      PROD[i][j] = EXP[LOG[i] + LOG[j]];
-}
-#define gf_mul(a, b) PROD[a][b]
-static gf gf_div(gf a, gf b) {
-  if (!a || !b) return 0;
-  int d = LOG[a] - LOG[b];
-  return EXP[d < 0 ? d + 255 : d];
-}
-
-// ---------------------------------------------------------------------------
-//      Lagrange interpolation and Horner's method in the Galois field.
-//      Uses the optimised (numerically unstable) quadratic-time algorithm.
-// ---------------------------------------------------------------------------
-static void lagrange(gf * x, gf * y, int n, gf * coef) {
-  gf c[n + 1]; memset(c, 0, sizeof(gf) * (n + 1)); c[0] = 1;
-  for (int i = 0; i < n; i++) {
-    for (int j = i; j > 0; j--)
-      c[j] = c[j - 1] ^ gf_mul(c[j], x[i]);
-    c[0] = gf_mul(c[0], x[i]);  c[i + 1] = 1;
-  }
-  gf P[n]; memset(P, 0, sizeof(gf) * n);
-  for (int i = 0; i < n; i++) {
-    gf d = 1, t;
-    for (int j = 0; j < n; j++)
-      if (i != j) d = gf_mul(d, x[i] ^ x[j]);
-    t = gf_div(y[i], d);
-    coef[n-1] ^= gf_mul(t, P[n-1] = 1);
-    for (int j = n - 2; j >= 0; j--)
-      coef[j] ^= gf_mul(t, P[j] = c[j+1] ^ gf_mul(x[i], P[j+1]));
-  }
-}
-
-static gf horner(gf * coef, int n, gf x) {
-  gf result = coef[n];
-  for (int i = n - 1; i >= 0; i--)
-    result = gf_mul(x, result) ^ coef[i];
-  return result;
 }
 
 // ---------------------------------------------------------------------------
 //      Feistel Network.
 // ---------------------------------------------------------------------------
-static void fisher(gf k[64], gf x[64]) {
-  for (int i = 63; i > 0; i--) {
-    int j = k[i] % (i + 1);
-    gf t = x[i]; x[i] = x[j]; x[j] = t;
-  }
-}
-static void fisher32(gf k[32], gf x[32]) {
+typedef struct { gf k1[32]; gf k2[64]; } block_key_t;
+
+static void fisher32(const gf k[64], gf x[32], int round) {
   for (int i = 31; i > 0; i--) {
-    int j = k[i] % (i + 1);
+    int j = k[(i + round * 21) & 63] % (i + 1);
     gf t = x[i]; x[i] = x[j]; x[j] = t;
   }
 }
-static void feistelF(gf b[32], gf k1[32], gf k2[64]) {
-  gf x[64], y[64], coeff[64] = { 0 };
-  for (int i = 0; i < 64; i++) x[i] = i;
-  for (int i = 0; i < 32; i++) y[i] = b[i] + i, y[i + 32] = k1[i] + i;
-  fisher(k2, x);  lagrange(x, y, 64, coeff);
-  for (int i = 0; i < 32; i++) b[i] = horner(coeff, 63, 255 - i);
+
+static void feistelF(gf b[32], const gf round_key[32],
+    const gf permutation_key[64], int round) {
+  gf input[32], permutation[32];
+  memcpy(input, b, sizeof(input));
+  for (int i = 0; i < 32; i++) permutation[i] = i;
+  fisher32(permutation_key, permutation, round);
+  for (int i = 0; i < 32; i++) {
+    gf mixed = input[permutation[i]]
+      ^ input[permutation[(i + 1) & 31]]
+      ^ permutation_key[(i + 32 + round * 11) & 63];
+    b[i] = EXP[(unsigned int) round_key[i] + LOG[mixed]];
+  }
 }
-static void keysched(gf in[32], gf k2[64], gf out[32], gf next[32]) {
-  gf x[32], y[32], coeff[32] = { 0 };
-  for (int i = 0; i < 32; i++) x[i] = i, y[i] = in[i] + i;
-  lagrange(x, y, 32, coeff);  fisher32(k2, x);
-  for (int i = 0; i < 32; i++)
-    out[i] = horner(coeff, 31, 64 + x[i]),
-    next[i] = horner(coeff, 31, 128 + x[i]),
-    k2[i] = horner(coeff, 31, 192 + x[i]);
+
+static void keysched(const block_key_t * key, uint32_t IV, gf out[3][32]) {
+  gf state[32], next[32];
+  memcpy(state, key->k1, sizeof(state));
+  for (int i = 0; i < 4; i++)
+    state[i] ^= (IV >> (i * 8)) & 0xff;
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < 32; i++) {
+      gf a = state[(i + 1) & 31]
+        ^ key->k2[(i + round * 17) & 63]
+        ^ (gf) round;
+      gf b = state[i] ^ key->k2[(i + 32 + round * 17) & 63];
+      next[i] = EXP[(unsigned int) a + LOG[b]];
+    }
+    memcpy(out[round], next, sizeof(next));
+    memcpy(state, next, sizeof(state));
+  }
 }
-static void feistel0(gf L[32], gf R[32], gf k1[3][32], gf k2[64]) {
+
+static void feistel0(gf L[32], gf R[32], gf k1[3][32],
+    const gf k2[64]) {
   for (int round = 0; round < 3; round++) {
     gf temp[32];
     memcpy(temp, R, 32);
-    feistelF(R, k1[round], k2);
+    feistelF(R, k1[round], k2, round);
     for (int i = 0; i < 32; i++) R[i] ^= L[i];
     memcpy(L, temp, 32);
   }
 }
-static void feistel1(gf L[32], gf R[32], gf k1[3][32], gf k2[64]) {
+static void feistel1(gf L[32], gf R[32], gf k1[3][32],
+    const gf k2[64]) {
   for (int round = 2; round >= 0; round--) {
     gf temp[32];
     memcpy(temp, L, 32);
-    feistelF(L, k1[round], k2);
+    feistelF(L, k1[round], k2, round);
     for (int i = 0; i < 32; i++) L[i] ^= R[i];
     memcpy(R, temp, 32);
   }
 }
-typedef struct { gf k1[32]; gf k2[64]; } block_key_t;
-static void encode_block(gf in[64], gf blk[64], uint32_t IV, block_key_t * key) {
+static void encode_block(gf in[64], gf blk[64], uint32_t IV,
+    const block_key_t * key) {
   gf keys[3][32];  memcpy(blk, in, 64);
-  for (int i = 0; i < 4; i++) key->k1[i] += (IV >> (i * 8)) & 0xff;
-  keysched(key->k1, key->k2, keys[0], key->k1);
-  keysched(key->k1, key->k2, keys[1], key->k1);
-  keysched(key->k1, key->k2, keys[2], key->k1);
+  keysched(key, IV, keys);
   feistel0(blk, blk + 32, keys, key->k2);
 }
-static void decode_block(gf in[64], gf blk[64], uint32_t IV, block_key_t * key) {
+static void decode_block(gf in[64], gf blk[64], uint32_t IV,
+    const block_key_t * key) {
   gf keys[3][32];  memcpy(blk, in, 64);
-  for (int i = 0; i < 4; i++) key->k1[i] += (IV >> (i * 8)) & 0xff;
-  keysched(key->k1, key->k2, keys[0], key->k1);
-  keysched(key->k1, key->k2, keys[1], key->k1);
-  keysched(key->k1, key->k2, keys[2], key->k1);
+  keysched(key, IV, keys);
   feistel1(blk, blk + 32, keys, key->k2);
 }
 
@@ -372,8 +345,8 @@ static void detect_mode_of_operation(FILE * ciphertext,
 
 static void help(void) {
   fprintf(stdout,
-    "kcrypt3 (Sun, 26 Jan 2025) - 3rd iteration of the KCrypt algorithm.\n"
-    "Usage: kcrypt3 [-e/d/g/r] [-v/p/h/f/c] [-m mode] [-k key] files...\n"
+    "kcrypt (Mon, 3 Aug 2026) - 4th iteration of the KCrypt algorithm.\n"
+    "Usage: kcrypt [-e/d/g/r] [-v/p/h/f/c] [-m mode] [-k key] files...\n"
     "Operations:\n"
     "  -e, --encode        Encode the input file.\n"
     "  -d, --decode        Decode the input file.\n"
@@ -388,14 +361,14 @@ static void help(void) {
     "Additional options:\n"
     "  -m, --mode=mode     Set the mode of operation (OFB/CTR).\n"
     "  -k, --key=key       Specify the key file.\n"
-    "Written by Kamila Szewczyk (kspalaiologos@gmail.com).\n"
+    "Written by Kamila Szewczyk (k@iczelia.net).\n"
     "Released to the public domain.\n"
   );
 }
 
 static void version(void) {
   fprintf(stdout,
-    "kcrypt3 (Sun, 26 Jan 2025) - 3rd iteration of the KCrypt algorithm.\n"
+    "kcrypt (Mon, 3 Aug 2026) - 4th iteration of the KCrypt algorithm.\n"
     "Written by Kamila Szewczyk. Released to the public domain.\n"
   );
 }
@@ -448,7 +421,7 @@ int main(int argc, char * argv[]) {
   yarg_result * res = yarg_parse(argc, argv, opt, settings);
   if (!res) eprintf("Out of memory.\n");
   if (res->error)
-    eprintf("%s\nTry `kcrypt3 --help' for more information.\n", res->error);
+    eprintf("%s\nTry `kcrypt --help' for more information.\n", res->error);
   int mode = -1, force = 0, progress = 0, force_stdout = 0;
   stream_enc enc = NULL; stream_dec dec = NULL;
   const char * key_path = NULL;

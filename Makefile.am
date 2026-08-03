@@ -1,4 +1,4 @@
 EXTRA_DIST = README.md
-bin_PROGRAMS = kcrypt3
+bin_PROGRAMS = kcrypt
 noinst_HEADERS = yarg.h
-kcrypt3_SOURCES = kcrypt3.c
+kcrypt_SOURCES = kcrypt.c

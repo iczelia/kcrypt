@@ -1,5 +1,5 @@
 AC_PREREQ([2.69])
-AC_INIT([kcrypt3],[1.0.0],[https://github.com/kspalaiologos/kcrypt3])
+AC_INIT([kcrypt],[1.0.0],[https://github.com/iczelia/kcrypt])
 AC_CONFIG_HEADERS([config.h])
 AC_COPYRIGHT([Released to the public domain by Kamila Szewczyk])
 AC_LANG([C])

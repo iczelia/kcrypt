@@ -7,7 +7,7 @@ config.log
 config.status
 Makefile
 *.o
-kcrypt3
+kcrypt
 configure~
 config.h.in~
 config.sub
