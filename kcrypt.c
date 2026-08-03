@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 #include <immintrin.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -18,6 +19,10 @@
 //      Galois field tables.
 // ---------------------------------------------------------------------------
 typedef uint8_t gf;
+enum {
+  KC_BLOCK_SIZE = 64, KC_HALF_SIZE = 32,
+  KC_NONCE_SIZE = 16, KC_ROUNDS = 16
+};
 static gf LOG[256], EXP[510];
 static void gentab(gf poly) {
   for (int l = 0, b = 1; l < 255; l++) {
@@ -26,11 +31,21 @@ static void gentab(gf poly) {
       b = (b - 256) ^ poly;
   }
 }
+static gf gf_mul2(gf value) {
+  unsigned int doubled = (unsigned int) value << 1;
+  if (value & 0x80)
+    doubled ^= 0x11d;
+  return (gf) doubled;
+}
+static gf gf_inv(gf value) {
+  return value == 0 ? 0 : EXP[255 - LOG[value]];
+}
 
 // ---------------------------------------------------------------------------
 //      Feistel Network.
 // ---------------------------------------------------------------------------
 typedef struct { gf k1[32]; gf k2[64]; } block_key_t;
+typedef struct { gf round[16][32]; gf permutation[64]; } expanded_key_t;
 
 static void fisher32(const gf k[64], gf x[32], int round) {
   for (int i = 31; i > 0; i--) {
@@ -38,7 +53,36 @@ static void fisher32(const gf k[64], gf x[32], int round) {
     gf t = x[i]; x[i] = x[j]; x[j] = t;
   }
 }
-
+static void diffuse32(gf value[32]) {
+  static const unsigned int offsets[] = { 1, 3, 7, 13 };
+  gf next[32];
+  for (size_t layer = 0;
+      layer < sizeof(offsets) / sizeof(offsets[0]); layer++) {
+    for (int i = 0; i < 32; i++)
+      next[i] = value[i] ^ gf_mul2(value[(i + offsets[layer]) & 31]);
+    memcpy(value, next, sizeof(next));
+  }
+}
+static void keysched(const block_key_t * key, expanded_key_t * expanded) {
+  gf state[32], next[32], permutation[32];
+  memcpy(state, key->k1, sizeof(state));
+  memcpy(expanded->permutation, key->k2, sizeof(expanded->permutation));
+  for (int round = 0; round < KC_ROUNDS; round++) {
+    for (int i = 0; i < 32; i++) permutation[i] = i;
+    fisher32(key->k2, permutation, round);
+    for (int i = 0; i < 32; i++) {
+      gf mixed = state[permutation[i]]
+        ^ gf_mul2(state[permutation[(i + 1) & 31]])
+        ^ key->k2[(i + round * 17) & 63]
+        ^ (gf) ((round + 1) * 0x9d + i);
+      next[i] = (gf) ((unsigned int) gf_inv(mixed)
+        + key->k2[(i + 32 + round * 29) & 63]);
+    }
+    diffuse32(next);
+    memcpy(expanded->round[round], next, sizeof(next));
+    memcpy(state, next, sizeof(state));
+  }
+}
 static void feistelF(gf b[32], const gf round_key[32],
     const gf permutation_key[64], int round) {
   gf input[32], permutation[32];
@@ -47,61 +91,25 @@ static void feistelF(gf b[32], const gf round_key[32],
   fisher32(permutation_key, permutation, round);
   for (int i = 0; i < 32; i++) {
     gf mixed = input[permutation[i]]
-      ^ input[permutation[(i + 1) & 31]]
+      ^ gf_mul2(input[permutation[(i + 1) & 31]])
       ^ permutation_key[(i + 32 + round * 11) & 63];
-    b[i] = EXP[(unsigned int) round_key[i] + LOG[mixed]];
+    b[i] = (gf) ((unsigned int) round_key[i] + gf_inv(mixed));
   }
+  diffuse32(b);
 }
-
-static void keysched(const block_key_t * key, uint32_t IV, gf out[3][32]) {
-  gf state[32], next[32];
-  memcpy(state, key->k1, sizeof(state));
-  for (int i = 0; i < 4; i++)
-    state[i] ^= (IV >> (i * 8)) & 0xff;
-  for (int round = 0; round < 3; round++) {
-    for (int i = 0; i < 32; i++) {
-      gf a = state[(i + 1) & 31]
-        ^ key->k2[(i + round * 17) & 63]
-        ^ (gf) round;
-      gf b = state[i] ^ key->k2[(i + 32 + round * 17) & 63];
-      next[i] = EXP[(unsigned int) a + LOG[b]];
-    }
-    memcpy(out[round], next, sizeof(next));
-    memcpy(state, next, sizeof(state));
-  }
-}
-
-static void feistel0(gf L[32], gf R[32], gf k1[3][32],
-    const gf k2[64]) {
-  for (int round = 0; round < 3; round++) {
+static void feistel0(gf L[32], gf R[32], const expanded_key_t * key) {
+  for (int round = 0; round < KC_ROUNDS; round++) {
     gf temp[32];
     memcpy(temp, R, 32);
-    feistelF(R, k1[round], k2, round);
+    feistelF(R, key->round[round], key->permutation, round);
     for (int i = 0; i < 32; i++) R[i] ^= L[i];
     memcpy(L, temp, 32);
   }
 }
-static void feistel1(gf L[32], gf R[32], gf k1[3][32],
-    const gf k2[64]) {
-  for (int round = 2; round >= 0; round--) {
-    gf temp[32];
-    memcpy(temp, L, 32);
-    feistelF(L, k1[round], k2, round);
-    for (int i = 0; i < 32; i++) L[i] ^= R[i];
-    memcpy(R, temp, 32);
-  }
-}
-static void encode_block(gf in[64], gf blk[64], uint32_t IV,
-    const block_key_t * key) {
-  gf keys[3][32];  memcpy(blk, in, 64);
-  keysched(key, IV, keys);
-  feistel0(blk, blk + 32, keys, key->k2);
-}
-static void decode_block(gf in[64], gf blk[64], uint32_t IV,
-    const block_key_t * key) {
-  gf keys[3][32];  memcpy(blk, in, 64);
-  keysched(key, IV, keys);
-  feistel1(blk, blk + 32, keys, key->k2);
+static void encode_block(const gf in[64], gf blk[64],
+    const expanded_key_t * key) {
+  memcpy(blk, in, 64);
+  feistel0(blk, blk + 32, key);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,8 +129,13 @@ static void eprintf(const char * fmt, ...) {
 #include <io.h>
 static void secrandom(void * buf, size_t len) {
   HCRYPTPROV hp;
-  CryptAcquireContext(&hp, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT);
-  CryptGenRandom(hp, len, buf);
+  if (!CryptAcquireContext(&hp, NULL, NULL, PROV_RSA_FULL,
+      CRYPT_VERIFYCONTEXT))
+    eprintf("Could not initialise the system random source.\n");
+  if (!CryptGenRandom(hp, (DWORD) len, buf)) {
+    CryptReleaseContext(hp, 0);
+    eprintf("Could not read from the system random source.\n");
+  }
   CryptReleaseContext(hp, 0);
 }
 #elif __unix__
@@ -132,9 +145,24 @@ static void secrandom(void * buf, size_t len) {
   int fd = open("/dev/urandom", O_RDONLY);
   if (fd < 0)
     eprintf("Could not open `/dev/urandom': %s\n", strerror(errno));
-  if (read(fd, buf, len) < 0)
-    eprintf("Could not read from `/dev/urandom': %s\n", strerror(errno));
-  close(fd);
+  gf * output = buf;
+  while (len > 0) {
+    ssize_t amount = read(fd, output, len);
+    if (amount < 0 && errno == EINTR)
+      continue;
+    if (amount <= 0) {
+      int saved_errno = errno;
+      close(fd);
+      if (amount == 0)
+        eprintf("Could not read from `/dev/urandom': unexpected EOF.\n");
+      eprintf("Could not read from `/dev/urandom': %s\n",
+        strerror(saved_errno));
+    }
+    output += (size_t) amount;
+    len -= (size_t) amount;
+  }
+  if (close(fd) < 0)
+    eprintf("Could not close `/dev/urandom': %s\n", strerror(errno));
 }
 #elif __MSDOS__
 static void secrandom(void * buf, size_t len) { // Doug Kaufman's NOISE.SYS
@@ -153,37 +181,32 @@ static void secrandom(void * buf, size_t len) { // Doug Kaufman's NOISE.SYS
 enum { CIPHER_STREAM_FILE, CIPHER_STREAM_BLOCK, CIPHER_STREAM_FUNCTION };
 typedef struct {
   int type;
-  uint32_t max;
+  uint64_t max;
   union {
     FILE * file;
     struct {
       size_t (* read)(void * ptr, size_t size, size_t nmemb, void * stream);
       size_t (* write)(const void * ptr, size_t size, size_t nmemb, void * stream);
-      uint32_t (* tell)(void * stream);
+      uint64_t (* tell)(void * stream);
       void * stream;
     } stream;
     struct {
       uint8_t * buffer;
-      uint32_t size, consumed;
+      size_t size, consumed;
     };
   };
 } cipher_aux_t;
-static void write32_le_buf(uint32_t val, gf * buf) {
-  for (int i = 0; i < 4; i++)
-    buf[i] = (val >> (i * 8)) & 0xff;
-}
-static void read32_le_buf(uint32_t * val, gf * buf) {
-  *val = 0;
-  for (int i = 0; i < 4; i++)
-    *val |= buf[i] << (i * 8);
+static void write64_le_buf(uint64_t value, gf buffer[8]) {
+  for (int i = 0; i < 8; i++)
+    buffer[i] = (gf) (value >> (i * 8));
 }
 static size_t cipher_aux_fread(void * ptr, size_t size,
     size_t nmemb, cipher_aux_t * stream) {
   if (stream->type == CIPHER_STREAM_FILE) {
-    ssize_t read;
-    if((read = fread(ptr, size, nmemb, stream->file)) < 0)
+    size_t amount = fread(ptr, size, nmemb, stream->file);
+    if (amount < nmemb && ferror(stream->file))
       eprintf("Could not read from the input file: %s\n", strerror(errno));
-    return read;
+    return amount;
   } else if (stream->type == CIPHER_STREAM_FUNCTION) {
     return stream->stream.read(ptr, size, nmemb, stream->stream.stream);
   }
@@ -199,7 +222,7 @@ static size_t cipher_aux_fwrite(const void * ptr, size_t size,
     return 0;
   if (stream->type == CIPHER_STREAM_FILE) {
     if(fwrite(ptr, size, nmemb, stream->file) != nmemb)
-      eprintf("Could not write to the output file.\n", strerror(errno));
+      eprintf("Could not write to the output file: %s\n", strerror(errno));
     return nmemb;
   }
   else if (stream->type == CIPHER_STREAM_FUNCTION)
@@ -210,127 +233,122 @@ static size_t cipher_aux_fwrite(const void * ptr, size_t size,
   stream->consumed += size * nmemb;
   return nmemb;
 }
-static uint32_t cipher_aux_ftell(cipher_aux_t * stream) {
-  if (stream->type == CIPHER_STREAM_FILE)
-    return ftell(stream->file);
+static uint64_t cipher_aux_ftell(cipher_aux_t * stream) {
+  if (stream->type == CIPHER_STREAM_FILE) {
+    long position = ftell(stream->file);
+    return position < 0 ? 0 : (uint64_t) position;
+  }
   else if (stream->type == CIPHER_STREAM_FUNCTION)
     return stream->stream.tell(stream->stream.stream);
   return stream->consumed;
 }
 
-typedef void (* fprogress_cb)(uint32_t processed, uint32_t total);
+typedef void (* fprogress_cb)(uint64_t processed, uint64_t total);
 typedef struct {
   fprogress_cb pcb;
-  block_key_t key;
+  expanded_key_t key;
   cipher_aux_t input, output;
 } mode_params_t;
 
 typedef void (* stream_enc)(mode_params_t * params);
 typedef void (* stream_dec)(mode_params_t * params);
 
-static uint32_t cipher_check_header(mode_params_t * params) {
-  uint32_t IV; char h[4];
-  if (cipher_aux_fread(h, 1, 4, &params->input) != 4)
+static void cipher_check_header(mode_params_t * params,
+    gf nonce[KC_NONCE_SIZE]) {
+  if (cipher_aux_fread(nonce, 1, KC_NONCE_SIZE, &params->input)
+      != KC_NONCE_SIZE)
     eprintf("Truncated input.\n");
-  read32_le_buf(&IV, h); return IV;
 }
-static uint32_t cipher_put_header(char * hdr, mode_params_t * params) {
-  size_t hdr_len = strlen(hdr); char actual_hdr[hdr_len + 4];
+static void cipher_put_header(const char * hdr, mode_params_t * params,
+    gf nonce[KC_NONCE_SIZE]) {
+  size_t hdr_len = strlen(hdr);
+  gf actual_hdr[6 + KC_NONCE_SIZE];
+  if (hdr_len != 6)
+    eprintf("Internal error: invalid ciphertext header.\n");
   memcpy(actual_hdr, hdr, hdr_len);
-  uint32_t IV; secrandom(&IV, 4);
-  write32_le_buf(IV, actual_hdr + hdr_len);
-  cipher_aux_fwrite(actual_hdr, 1, hdr_len + 4, &params->output);
-  return IV;
+  secrandom(nonce, KC_NONCE_SIZE);
+  memcpy(actual_hdr + hdr_len, nonce, KC_NONCE_SIZE);
+  cipher_aux_fwrite(actual_hdr, 1, sizeof(actual_hdr), &params->output);
 }
 
 // ---------------------------------------------------------------------------
-//      CTR mode of operation. Assumes buffers are aligned to 32 bytes.
+//      Standard length-preserving CTR and OFB modes.
 // ---------------------------------------------------------------------------
-static void encode_ctr(mode_params_t * params) {
-  uint32_t IV = cipher_put_header("KC3CTR", params);
-  gf in[64] = { 0 }, out[64]; int8_t read = 0;
-  while ((read = cipher_aux_fread(in, 1, 63, &params->input)) > 0) {
-    for (int8_t i = read; i < 63; i++) in[i] = 63 - read;  in[63] = read;
-    encode_block(in, out, IV, &params->key);
+static void crypt_ctr(mode_params_t * params, int encode) {
+  gf nonce[KC_NONCE_SIZE], input[KC_BLOCK_SIZE], output[KC_BLOCK_SIZE];
+  gf counter_block[KC_BLOCK_SIZE] = { 0 }, key_stream[KC_BLOCK_SIZE];
+  uint64_t counter = 0;
+
+  if (encode)
+    cipher_put_header("KC4CTR", params, nonce);
+  else
+    cipher_check_header(params, nonce);
+  memcpy(counter_block, nonce, sizeof(nonce));
+  counter_block[KC_BLOCK_SIZE - 1] = 1; /* Mode-domain separator. */
+
+  size_t amount;
+  while ((amount = cipher_aux_fread(input, 1, sizeof(input),
+      &params->input)) > 0) {
+    write64_le_buf(counter, counter_block + KC_NONCE_SIZE);
+    encode_block(counter_block, key_stream, &params->key);
+    for (size_t i = 0; i < amount; i++)
+      output[i] = input[i] ^ key_stream[i];
+    cipher_aux_fwrite(output, 1, amount, &params->output);
     if (params->pcb)
       params->pcb(cipher_aux_ftell(&params->input), params->input.max);
-    cipher_aux_fwrite(out, 1, 64, &params->output);
-    IV++;
+    if (counter == UINT64_MAX)
+      eprintf("Input is too large for CTR mode.\n");
+    counter++;
   }
 }
 
-static void decode_ctr(mode_params_t * params) {
-  uint32_t IV = cipher_check_header(params);
-  gf in[64], out[64]; int8_t read = 63;
-  while (read == 63) {
-    if (cipher_aux_fread(in, 1, 64, &params->input) != 64)
-      eprintf("Truncated input.\n");
-    decode_block(in, out, IV, &params->key);
+static void encode_ctr(mode_params_t * params) { crypt_ctr(params, 1); }
+static void decode_ctr(mode_params_t * params) { crypt_ctr(params, 0); }
+
+static void crypt_ofb(mode_params_t * params, int encode) {
+  gf nonce[KC_NONCE_SIZE], input[KC_BLOCK_SIZE], output[KC_BLOCK_SIZE];
+  gf state[KC_BLOCK_SIZE] = { 0 }, next[KC_BLOCK_SIZE];
+
+  if (encode)
+    cipher_put_header("KC4OFB", params, nonce);
+  else
+    cipher_check_header(params, nonce);
+  memcpy(state, nonce, sizeof(nonce));
+  state[KC_BLOCK_SIZE - 1] = 2; /* Mode-domain separator. */
+
+  size_t amount;
+  while ((amount = cipher_aux_fread(input, 1, sizeof(input),
+      &params->input)) > 0) {
+    encode_block(state, next, &params->key);
+    memcpy(state, next, sizeof(state));
+    for (size_t i = 0; i < amount; i++)
+      output[i] = input[i] ^ state[i];
+    cipher_aux_fwrite(output, 1, amount, &params->output);
     if (params->pcb)
       params->pcb(cipher_aux_ftell(&params->input), params->input.max);
-    cipher_aux_fwrite(out, 1, read = out[63], &params->output);
-    IV++;
   }
 }
 
-// ---------------------------------------------------------------------------
-//      OFB mode of operation. Assumes buffers are aligned to 64 bytes.
-// ---------------------------------------------------------------------------
-static void encode_ofb(mode_params_t * params) {
-  uint32_t IV = cipher_put_header("KC3OFB", params);
-  gf in[64] = { 0 }, out[64], prev_out[64]; int8_t read;
-  read = cipher_aux_fread(in, 1, 63, &params->input);
-  for (int8_t i = read; i < 63; i++) in[i] = 63 - read;  in[63] = read;
-  encode_block(in, prev_out, IV, &params->key);
-  if (params->pcb)
-    params->pcb(cipher_aux_ftell(&params->input), params->input.max);
-  cipher_aux_fwrite(prev_out, 1, 64, &params->output);
-  IV++;
-  while ((read = cipher_aux_fread(in, 1, 63, &params->input)) > 0) {
-    for (int8_t i = read; i < 63; i++) in[i] = 63 - read;  in[63] = read;
-    for (int i = 0; i < 64; i++) in[i] ^= prev_out[i];
-    encode_block(in, out, IV, &params->key);
-    if (params->pcb)
-      params->pcb(cipher_aux_ftell(&params->input), params->input.max);
-    cipher_aux_fwrite(out, 1, 64, &params->output);
-    IV++;
-    memcpy(prev_out, out, 64);
-  }
-}
-
-static void decode_ofb(mode_params_t * params) {
-  uint32_t IV = cipher_check_header(params);
-  gf in[64], prev_in[64], out[64]; int8_t read;
-  if (cipher_aux_fread(prev_in, 1, 64, &params->input) != 64)
-    eprintf("Truncated input.\n");
-  decode_block(prev_in, out, IV, &params->key);
-  if (params->pcb)
-    params->pcb(cipher_aux_ftell(&params->input), params->input.max);
-  cipher_aux_fwrite(out, 1, read = out[63], &params->output);
-  IV++;
-  while (read == 63) {
-    if (cipher_aux_fread(in, 1, 64, &params->input) != 64)
-      eprintf("Truncated input.\n");
-    decode_block(in, out, IV, &params->key);
-    if (params->pcb)
-      params->pcb(cipher_aux_ftell(&params->input), params->input.max);
-    for (int i = 0; i < 64; i++) out[i] ^= prev_in[i];
-    cipher_aux_fwrite(out, 1, read = out[63], &params->output);
-    IV++;
-    memcpy(prev_in, in, 64);
-  }
-}
+static void encode_ofb(mode_params_t * params) { crypt_ofb(params, 1); }
+static void decode_ofb(mode_params_t * params) { crypt_ofb(params, 0); }
 
 // ---------------------------------------------------------------------------
 //      Command-line stub.
 // ---------------------------------------------------------------------------
 enum { MODE_ENCODE, MODE_DECODE, MODE_KEYGEN, MODE_RANDOM };
 
-static uint32_t file_size(FILE * f) {
-  fseek(f, 0, SEEK_END);
-  uint32_t size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  return size;
+static uint64_t file_size(FILE * file) {
+  long original = ftell(file);
+  if (original < 0 || fseek(file, 0, SEEK_END) != 0) {
+    clearerr(file);
+    return 0;
+  }
+  long end = ftell(file);
+  if (fseek(file, original, SEEK_SET) != 0 || end < 0) {
+    clearerr(file);
+    return 0;
+  }
+  return (uint64_t) end;
 }
 
 static void detect_mode_of_operation(FILE * ciphertext,
@@ -338,8 +356,8 @@ static void detect_mode_of_operation(FILE * ciphertext,
   char hdr[6];
   if (fread(hdr, 1, 6, ciphertext) != 6)
     eprintf("Truncated input.\n");
-  if (!memcmp(hdr, "KC3CTR", 6))      *e = encode_ctr, *d = decode_ctr;
-  else if (!memcmp(hdr, "KC3OFB", 6)) *e = encode_ofb, *d = decode_ofb;
+  if (!memcmp(hdr, "KC4CTR", 6))      *e = encode_ctr, *d = decode_ctr;
+  else if (!memcmp(hdr, "KC4OFB", 6)) *e = encode_ofb, *d = decode_ofb;
   else eprintf("Input corrupted: unknown mode of operation.\n");
 }
 
@@ -373,28 +391,32 @@ static void version(void) {
   );
 }
 
-static void progress_callback(uint32_t processed, uint32_t total) {
+static void progress_callback(uint64_t processed, uint64_t total) {
   if ((processed % 8192) == 0) {
     processed /= 1024; total /= 1024;
     if (total == 0)
-      fprintf(stderr, "\rProcessed: %ukB.", processed);
+      fprintf(stderr, "\rProcessed: %" PRIu64 "kB.", processed);
     else
-      fprintf(stderr, "\rProcessed: %u/%ukB.", processed, total);
+      fprintf(stderr, "\rProcessed: %" PRIu64 "/%" PRIu64 "kB.",
+        processed, total);
   }
 }
 
 static size_t zerodev_read(void * ptr, size_t size,
     size_t nmemb, void * stream) {
   memset(ptr, 0, size * nmemb);
-  *((uint32_t *) stream) += size * nmemb;
+  *((uint64_t *) stream) += size * nmemb;
   return nmemb;
 }
 static size_t zerodev_write(const void * ptr, size_t size,
     size_t nmemb, void * stream) {
+  (void) ptr;
+  (void) size;
+  (void) stream;
   return nmemb;
 }
-static uint32_t zerodev_tell(void * stream) {
-  return *((uint32_t *) stream);
+static uint64_t zerodev_tell(void * stream) {
+  return *((uint64_t *) stream);
 }
 
 int main(int argc, char * argv[]) {
@@ -438,7 +460,8 @@ int main(int argc, char * argv[]) {
       case 'c': force_stdout = 1; break;
       case 'k': key_path = res->args[i].arg; break;
       case 'm':
-        for (char * p = res->args[i].arg; *p; p++) *p = tolower(*p);
+        for (char * p = res->args[i].arg; *p; p++)
+          *p = (char) tolower((unsigned char) *p);
         if (!strcmp(res->args[i].arg, "ofb"))
           enc = encode_ofb, dec = decode_ofb;
         else if (!strcmp(res->args[i].arg, "ctr"))
@@ -470,7 +493,7 @@ int main(int argc, char * argv[]) {
         if (!force_stdout) {
           output = malloc(strlen(f1) + 5);
           strcpy(output, f1);
-          strcat(output, ".kc3");
+          strcat(output, ".kc4");
         }
       } else { input = f1, output = f2; }
     } else if (mode == MODE_DECODE) {
@@ -479,7 +502,7 @@ int main(int argc, char * argv[]) {
         if(!force_stdout) {
           output = malloc(strlen(f1) + 1);
           strcpy(output, f1);
-          if (strlen(f1) > 4 && !strcmp(f1 + strlen(f1) - 4, ".kc3"))
+          if (strlen(f1) > 4 && !strcmp(f1 + strlen(f1) - 4, ".kc4"))
             output[strlen(f1) - 4] = 0;
           else
             eprintf("File `%s' has an unrecognised extension.\n", f1);
@@ -501,7 +524,18 @@ int main(int argc, char * argv[]) {
       eprintf("Could not open `%s': %s\n", input, strerror(errno));
   }
   if (key_path != NULL) {
+    #if defined(__unix__)
+    if (mode == MODE_KEYGEN) {
+      int key_fd = open(key_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (key_fd >= 0)
+        key_file = fdopen(key_fd, "wb");
+      if (key_fd >= 0 && !key_file)
+        close(key_fd);
+    } else
+      key_file = fopen(key_path, "rb");
+    #else
     key_file = fopen(key_path, mode == MODE_KEYGEN ? "wb" : "rb");
+    #endif
     if (!key_file)
       eprintf("Could not open `%s': %s\n", key_path, strerror(errno));
   }
@@ -524,17 +558,20 @@ int main(int argc, char * argv[]) {
       if (!key_file) eprintf("No key file specified.\n");
       if (!enc || !dec)
         eprintf("No mode of operation specified.\n");
-      block_key_t k;
-      if (fread(&k, sizeof(k), 1, key_file) != 1)
+      block_key_t raw_key;
+      expanded_key_t key;
+      if (fread(&raw_key, sizeof(raw_key), 1, key_file) != 1)
         eprintf("Truncated input.\n");
-      uint32_t zero_tell = 0;
+      keysched(&raw_key, &key);
+      memset(&raw_key, 0, sizeof(raw_key));
+      uint64_t zero_tell = 0;
       cipher_aux_t zero_device = {
         .type = CIPHER_STREAM_FUNCTION, .max = 0,
         .stream = { zerodev_read, zerodev_write, zerodev_tell, &zero_tell }
       };
       mode_params_t params = {
         .pcb = progress ? progress_callback : NULL,
-        .key = k, .input = zero_device, .output = {
+        .key = key, .input = zero_device, .output = {
           .type = CIPHER_STREAM_FILE, .file = out_file
         }
       };
@@ -545,9 +582,12 @@ int main(int argc, char * argv[]) {
       if (!key_file) eprintf("No key file specified.\n");
       if (!enc || !dec)
         eprintf("No mode of operation specified.\n");
-      block_key_t k;
-      if (fread(&k, sizeof(k), 1, key_file) != 1)
+      block_key_t raw_key;
+      expanded_key_t key;
+      if (fread(&raw_key, sizeof(raw_key), 1, key_file) != 1)
         eprintf("Truncated input.\n");
+      keysched(&raw_key, &key);
+      memset(&raw_key, 0, sizeof(raw_key));
       cipher_aux_t input = {
         .type = CIPHER_STREAM_FILE, .file = in_file, .max = file_size(in_file)
       };
@@ -556,7 +596,7 @@ int main(int argc, char * argv[]) {
       };
       mode_params_t params = {
         .pcb = progress ? progress_callback : NULL,
-        .key = k, .input = input, .output = output
+        .key = key, .input = input, .output = output
       };
       enc(&params);
       break;
@@ -565,9 +605,12 @@ int main(int argc, char * argv[]) {
       if (!key_file) eprintf("No key file specified.\n");
       if (enc || dec)
         eprintf("Mode of operation needs not specified for decryption.\n");
-      block_key_t k;
-      if (fread(&k, sizeof(k), 1, key_file) != 1)
+      block_key_t raw_key;
+      expanded_key_t key;
+      if (fread(&raw_key, sizeof(raw_key), 1, key_file) != 1)
         eprintf("Truncated input.\n");
+      keysched(&raw_key, &key);
+      memset(&raw_key, 0, sizeof(raw_key));
       cipher_aux_t input = {
         .type = CIPHER_STREAM_FILE, .file = in_file, .max = file_size(in_file)
       };
@@ -576,7 +619,7 @@ int main(int argc, char * argv[]) {
       };
       mode_params_t params = {
         .pcb = progress ? progress_callback : NULL,
-        .key = k, .input = input, .output = output
+        .key = key, .input = input, .output = output
       };
       detect_mode_of_operation(in_file, &enc, &dec);
       dec(&params);
@@ -587,4 +630,6 @@ int main(int argc, char * argv[]) {
     eprintf("Could not close `%s': %s\n", input, strerror(errno));
   if (output != NULL && fclose(out_file) != 0)
     eprintf("Could not close `%s': %s\n", output, strerror(errno));
+  if (key_file != NULL && fclose(key_file) != 0)
+    eprintf("Could not close key file: %s\n", strerror(errno));
 }
