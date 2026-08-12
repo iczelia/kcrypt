@@ -2,7 +2,9 @@
 //      KCrypt - 4th iteration of a cryptographic algorithm.
 //      Written on Monday, 3rd of August 2026 by Kamila Szewczyk.
 // ---------------------------------------------------------------------------
-#include <immintrin.h>
+#ifdef HAVE_CONFIG_H
+  #include "config.h"
+#endif
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -12,45 +14,104 @@
 #include <stdarg.h>
 #include <ctype.h>
 #include <stdlib.h>
-#include <x86intrin.h>
 #include "yarg.h"
 
 // ---------------------------------------------------------------------------
-//      Galois field tables.
+//      Constant-time Galois field arithmetic.
 // ---------------------------------------------------------------------------
 typedef uint8_t gf;
 enum {
-  KC_BLOCK_SIZE = 64, KC_HALF_SIZE = 32,
-  KC_NONCE_SIZE = 16, KC_ROUNDS = 16
+  KC_BLOCK_SIZE = 64, KC_HALF_SIZE = 32, KC_NONCE_SIZE = 16, KC_ROUNDS = 16
 };
-static gf LOG[256], EXP[510];
-static void gentab(gf poly) {
-  for (int l = 0, b = 1; l < 255; l++) {
-    LOG[b] = l;  EXP[l] = EXP[l + 255] = b;
-    if ((b <<= 1) >= 256)
-      b = (b - 256) ^ poly;
-  }
+/*  Optimisation barrier.  */
+#if !defined(HAVE_ASM_BARRIER) && (defined(__GNUC__) || defined(__clang__))
+  #define HAVE_ASM_BARRIER 1
+#endif
+#ifdef HAVE_ASM_BARRIER
+static gf gf_opaque(gf value) {
+  __asm__ volatile ("" : "+r" (value));  return value;
+}
+#else
+static gf gf_opaque(gf value) {
+  volatile gf laundered = value;  return laundered;
+}
+#endif
+static void wipe(void * buffer, size_t length) {
+  volatile gf * target = buffer;
+  while (length--)
+    *target++ = 0;
+  #ifdef HAVE_ASM_BARRIER
+    __asm__ volatile ("" : : : "memory");
+  #endif
+}
+/*  All ones when the arguments are equal, all zeroes otherwise.  */
+static gf gf_eq(gf a, gf b) {
+  return gf_opaque((gf) (((uint32_t) (gf) (a ^ b) - 1) >> 8));
 }
 static gf gf_mul2(gf value) {
-  unsigned int doubled = (unsigned int) value << 1;
-  if (value & 0x80)
-    doubled ^= 0x11d;
-  return (gf) doubled;
+  gf carry = gf_opaque((gf) -(gf) (value >> 7));
+  return (gf) ((unsigned int) value << 1) ^ (carry & 0x1d);
 }
+static gf gf_mul(gf a, gf b) {
+  gf product = 0;
+  for (int i = 0; i < 8; i++) {
+    product ^= a & gf_opaque((gf) -(gf) (b & 1));
+    b >>= 1;  a = gf_mul2(a);
+  }
+  return product;
+}
+/*  The multiplicative inverse is value^254, reached by an addition chain.  */
 static gf gf_inv(gf value) {
-  return value == 0 ? 0 : EXP[255 - LOG[value]];
+  gf square = gf_mul(value, value);
+  gf cube = gf_mul(square, value);
+  gf sixth = gf_mul(cube, cube);
+  gf twelfth = gf_mul(sixth, sixth);
+  gf accumulator = gf_mul(twelfth, cube);           /* value^15  */
+  for (int i = 0; i < 4; i++)
+    accumulator = gf_mul(accumulator, accumulator); /* value^240 */
+  return gf_mul(gf_mul(accumulator, twelfth), square);
+}
+/*  Remainder by bitwise long division.  */
+static gf gf_mod(gf value, gf modulus) {
+  uint32_t remainder = 0;
+  for (int i = 7; i >= 0; i--) {
+    remainder += remainder + ((value >> i) & 1);
+    uint32_t borrowed = remainder - modulus;
+    gf underflow = gf_opaque((gf) -(gf) (borrowed >> 31));
+    remainder = borrowed + (modulus & underflow);
+  }
+  return (gf) remainder;
 }
 
 // ---------------------------------------------------------------------------
 //      Feistel Network.
 // ---------------------------------------------------------------------------
 typedef struct { gf k1[32]; gf k2[64]; } block_key_t;
-typedef struct { gf round[16][32]; gf permutation[64]; } expanded_key_t;
+typedef struct {
+  gf k2[64];
+  gf round[16][32];
+  gf permutation[16][32];
+} expanded_key_t;
 
+/*  A Fisher-Yates shuffle whose exchange is applied as a masked swap against
+    every position, so the addresses touched do not reveal the key. */
 static void fisher32(const gf k[64], gf x[32], int round) {
+  for (int i = 0; i < 32; i++) x[i] = (gf) i;
   for (int i = 31; i > 0; i--) {
-    int j = k[(i + round * 21) & 63] % (i + 1);
-    gf t = x[i]; x[i] = x[j]; x[j] = t;
+    gf j = gf_mod(k[(i + round * 21) & 63], (gf) (i + 1));
+    for (int q = 0; q < 32; q++) {
+      gf t = (gf) (x[i] ^ x[q]) & gf_eq((gf) q, j);
+      x[i] ^= t; x[q] ^= t;
+    }
+  }
+}
+/*  out[i] = in[permutation[i]], read as a masked scan over the input.  */
+static void permute32(gf out[32], const gf in[32], const gf permutation[32]) {
+  for (int i = 0; i < 32; i++) {
+    gf gathered = 0;
+    for (int q = 0; q < 32; q++)
+      gathered |= in[q] & gf_eq((gf) q, permutation[i]);
+    out[i] = gathered;
   }
 }
 static void diffuse32(gf value[32]) {
@@ -62,49 +123,56 @@ static void diffuse32(gf value[32]) {
       next[i] = value[i] ^ gf_mul2(value[(i + offsets[layer]) & 31]);
     memcpy(value, next, sizeof(next));
   }
+  wipe(next, sizeof(next));
 }
+/*  The round permutations depend only on the key, so they are derived once
+    here rather than being rebuilt for every block that gets encrypted.  */
 static void keysched(const block_key_t * key, expanded_key_t * expanded) {
-  gf state[32], next[32], permutation[32];
+  gf state[32], next[32], permuted[32];
   memcpy(state, key->k1, sizeof(state));
-  memcpy(expanded->permutation, key->k2, sizeof(expanded->permutation));
+  memcpy(expanded->k2, key->k2, sizeof(expanded->k2));
   for (int round = 0; round < KC_ROUNDS; round++) {
-    for (int i = 0; i < 32; i++) permutation[i] = i;
-    fisher32(key->k2, permutation, round);
+    fisher32(expanded->k2, expanded->permutation[round], round);
+    permute32(permuted, state, expanded->permutation[round]);
     for (int i = 0; i < 32; i++) {
-      gf mixed = state[permutation[i]]
-        ^ gf_mul2(state[permutation[(i + 1) & 31]])
-        ^ key->k2[(i + round * 17) & 63]
+      gf mixed = permuted[i]
+        ^ gf_mul2(permuted[(i + 1) & 31])
+        ^ expanded->k2[(i + round * 17) & 63]
         ^ (gf) ((round + 1) * 0x9d + i);
       next[i] = (gf) ((unsigned int) gf_inv(mixed)
-        + key->k2[(i + 32 + round * 29) & 63]);
+        + expanded->k2[(i + 32 + round * 29) & 63]);
     }
     diffuse32(next);
     memcpy(expanded->round[round], next, sizeof(next));
     memcpy(state, next, sizeof(state));
   }
+  wipe(state, sizeof(state));
+  wipe(next, sizeof(next));
+  wipe(permuted, sizeof(permuted));
 }
 static void feistelF(gf b[32], const gf round_key[32],
-    const gf permutation_key[64], int round) {
-  gf input[32], permutation[32];
-  memcpy(input, b, sizeof(input));
-  for (int i = 0; i < 32; i++) permutation[i] = i;
-  fisher32(permutation_key, permutation, round);
+    const gf permutation_key[64], const gf permutation[32], int round) {
+  gf permuted[32];
+  permute32(permuted, b, permutation);
   for (int i = 0; i < 32; i++) {
-    gf mixed = input[permutation[i]]
-      ^ gf_mul2(input[permutation[(i + 1) & 31]])
+    gf mixed = permuted[i]
+      ^ gf_mul2(permuted[(i + 1) & 31])
       ^ permutation_key[(i + 32 + round * 11) & 63];
     b[i] = (gf) ((unsigned int) round_key[i] + gf_inv(mixed));
   }
   diffuse32(b);
+  wipe(permuted, sizeof(permuted));
 }
 static void feistel0(gf L[32], gf R[32], const expanded_key_t * key) {
+  gf temp[32];
   for (int round = 0; round < KC_ROUNDS; round++) {
-    gf temp[32];
-    memcpy(temp, R, 32);
-    feistelF(R, key->round[round], key->permutation, round);
+    memcpy(temp, R, sizeof(temp));
+    feistelF(R, key->round[round], key->k2,
+      key->permutation[round], round);
     for (int i = 0; i < 32; i++) R[i] ^= L[i];
-    memcpy(L, temp, 32);
+    memcpy(L, temp, sizeof(temp));
   }
+  wipe(temp, sizeof(temp));
 }
 static void encode_block(const gf in[64], gf blk[64],
     const expanded_key_t * key) {
@@ -410,17 +478,13 @@ static size_t zerodev_read(void * ptr, size_t size,
 }
 static size_t zerodev_write(const void * ptr, size_t size,
     size_t nmemb, void * stream) {
-  (void) ptr;
-  (void) size;
-  (void) stream;
-  return nmemb;
+  (void) ptr;  (void) size;  (void) stream;  return nmemb;
 }
 static uint64_t zerodev_tell(void * stream) {
   return *((uint64_t *) stream);
 }
 
 int main(int argc, char * argv[]) {
-  gentab(0x1d);
   yarg_options opt[] = {
     // Actions
     { 'e', no_argument, "encode" },
@@ -550,7 +614,9 @@ int main(int argc, char * argv[]) {
     case MODE_KEYGEN: {
       if (!key_file) eprintf("No key file specified.\n");
       block_key_t k; secrandom(&k, sizeof(k));
-      if (fwrite(&k, sizeof(k), 1, key_file) != 1)
+      int written = fwrite(&k, sizeof(k), 1, key_file) == 1;
+      wipe(&k, sizeof(k));
+      if (!written)
         eprintf("Could not write to key file: %s\n", strerror(errno));
       break;
     }
@@ -563,7 +629,7 @@ int main(int argc, char * argv[]) {
       if (fread(&raw_key, sizeof(raw_key), 1, key_file) != 1)
         eprintf("Truncated input.\n");
       keysched(&raw_key, &key);
-      memset(&raw_key, 0, sizeof(raw_key));
+      wipe(&raw_key, sizeof(raw_key));
       uint64_t zero_tell = 0;
       cipher_aux_t zero_device = {
         .type = CIPHER_STREAM_FUNCTION, .max = 0,
@@ -587,7 +653,7 @@ int main(int argc, char * argv[]) {
       if (fread(&raw_key, sizeof(raw_key), 1, key_file) != 1)
         eprintf("Truncated input.\n");
       keysched(&raw_key, &key);
-      memset(&raw_key, 0, sizeof(raw_key));
+      wipe(&raw_key, sizeof(raw_key));
       cipher_aux_t input = {
         .type = CIPHER_STREAM_FILE, .file = in_file, .max = file_size(in_file)
       };
@@ -610,7 +676,7 @@ int main(int argc, char * argv[]) {
       if (fread(&raw_key, sizeof(raw_key), 1, key_file) != 1)
         eprintf("Truncated input.\n");
       keysched(&raw_key, &key);
-      memset(&raw_key, 0, sizeof(raw_key));
+      wipe(&raw_key, sizeof(raw_key));
       cipher_aux_t input = {
         .type = CIPHER_STREAM_FILE, .file = in_file, .max = file_size(in_file)
       };
